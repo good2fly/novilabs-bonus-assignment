@@ -12,8 +12,8 @@ import software.amazon.awscdk.services.ecr.IRepository;
 import software.amazon.awscdk.services.ecr.Repository;
 import software.amazon.awscdk.services.ecs.Volume;
 import software.amazon.awscdk.services.ecs.*;
-import software.amazon.awscdk.services.efs.CfnFileSystem;
 import software.amazon.awscdk.services.efs.FileSystem;
+import software.amazon.awscdk.services.efs.PerformanceMode;
 import software.amazon.awscdk.services.iam.*;
 import software.amazon.awscdk.services.logs.RetentionDays;
 import software.constructs.Construct;
@@ -59,12 +59,18 @@ public class NovilabsAssignmentCdkStack extends Stack {
         SecurityGroup taskSecurityGroup = SecurityGroup.Builder.create(this, "NovilabsHomeworkTaskSG")
                 .vpc(vpc)
                 .securityGroupName("novilabs-homework-task-sg")
+                .allowAllOutbound(true)
                 .build();
+        taskSecurityGroup.addIngressRule(
+                Peer.anyIpv4(),
+                Port.tcp(22)
+        );
 
         // Create a security group for EFS and allow inbound from ECS tasks on port 2049
         SecurityGroup efsSecurityGroup = SecurityGroup.Builder.create(this, "NovilabsHomeworkEfsSG")
                 .vpc(vpc)
                 .securityGroupName("novilabs-homework-efs-sg")
+                .allowAllOutbound(true)
                 .build();
         //   EFS must allow inbound from the task SG on NFS port 2049...
         efsSecurityGroup.addIngressRule(
@@ -91,6 +97,7 @@ public class NovilabsAssignmentCdkStack extends Stack {
                 .fileSystemName("novilabs-homework-efs")
                 .vpc(vpc)
                 .securityGroup(efsSecurityGroup)
+                .performanceMode(PerformanceMode.GENERAL_PURPOSE)
                 .encrypted(true)
                 .removalPolicy(RemovalPolicy.DESTROY) // or RETAIN in production
                 .build();
@@ -110,7 +117,8 @@ public class NovilabsAssignmentCdkStack extends Stack {
         Role taskRole = Role.Builder.create(this, "NovilabsHomeworkTaskRole")
                 .roleName("novilabs-homework-task-role")
                 .assumedBy(new ServicePrincipal("ecs-tasks.amazonaws.com"))
-                .managedPolicies(List.of(ManagedPolicy.fromAwsManagedPolicyName("AmazonElasticFileSystemClientReadWriteAccess")))
+                .managedPolicies(List.of(ManagedPolicy.fromAwsManagedPolicyName("AmazonElasticFileSystemClientReadWriteAccess"),
+                                         ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMManagedInstanceCore")))
                 .build();
         // Create the Fargate task definition w/ above roles
         FargateTaskDefinition taskDef = FargateTaskDefinition.Builder.create(this, "NovilabsHomeworkTaskDef")
@@ -126,7 +134,7 @@ public class NovilabsAssignmentCdkStack extends Stack {
 
         // Add EFS volume
         taskDef.addVolume(Volume.builder()
-                .name("NovilabsEfsVolume")
+                .name("NovilabsHomeworkEfsVolume")
                 .efsVolumeConfiguration(EfsVolumeConfiguration.builder()
                         .fileSystemId(efs.getFileSystemId())
                         .rootDirectory("/") // mount root of EFS
@@ -152,45 +160,104 @@ public class NovilabsAssignmentCdkStack extends Stack {
 
         container.addMountPoints(MountPoint.builder()
                 .containerPath("/apppath")  // mount EFS inside container at /apppath
-                .sourceVolume("NovilabsEfsVolume")
+                .sourceVolume("NovilabsHomeworkEfsVolume")
                 .readOnly(false)
                 .build());
 
-        // (Optional) Automatically run the one-off task via AwsCustomResource
-        // This calls "ecs:RunTask" at deployment time
-        // TODO this seems flaky - tends to fail to mount the EFS volume, running the task by hand is fine - why?
-//        AwsCustomResource runTaskCustomResource = AwsCustomResource.Builder.create(this, "RunNovilabsHomeworkTask")
-//                .onCreate(AwsSdkCall.builder()
-//                        .service("ECS")
-//                        .action("runTask")
-//                        .parameters(Map.of(
-//                                "cluster", cluster.getClusterName(),
-//                                "launchType", "FARGATE",
-//                                "taskDefinition", taskDef.getTaskDefinitionArn(),
-//                                "networkConfiguration", Map.of(
-//                                        "awsvpcConfiguration", Map.of(
-//                                                "subnets", vpc.getPrivateSubnets().stream()
-//                                                        .map(subnet -> subnet.getSubnetId())
-//                                                        .collect(Collectors.toList()),
-//                                                // securityGroups => the task SG
-//                                                "securityGroups", List.of(taskSecurityGroup.getSecurityGroupId()),
-//                                                // Assign a public IP if needed to pull images or access the internet
-//                                                "assignPublicIp", "ENABLED"
-//                                        )
-//                                )
-//                        ))
-//                        // Provide a fixed PhysicalResourceId so it doesn't re-run every deploy
-//                        .physicalResourceId(PhysicalResourceId.of("NovilabsHomeworkOneOffTask"))
-//                        .build()
-//                )
-//                // Policy allowing this custom resource to call ecs:RunTask + pass roles
-//                .policy(AwsCustomResourcePolicy.fromStatements(List.of(
-//                        PolicyStatement.Builder.create()
-//                                .actions(List.of("ecs:RunTask", "iam:PassRole"))
-//                                // If you want to restrict resources, you'd specify your cluster ARN & taskDef ARN
-//                                .resources(List.of("*"))
-//                                .build()
-//                )))
-//                .build();
+        Instance instance = copyDataFileViaEc2AndS3(vpc, efs, taskSecurityGroup);
+
+        // TODO this seems flaky, failing to mount the file system - investigate later (works fine from console)
+        //AwsCustomResource runTaskResource = runTask(vpc, cluster, taskDef, taskSecurityGroup);
     }
+
+    /**
+     * Create an EC2 instance, mount the file system, and copy the provided CSV data file from S3.
+     *
+     * @param vpc
+     * @param fs
+     * @param taskSecurityGroup
+     * @return
+     */
+    private Instance copyDataFileViaEc2AndS3(Vpc vpc, FileSystem fs, SecurityGroup taskSecurityGroup) {
+        Role ec2Role = Role.Builder.create(this, "NovilabsHomeworkEc2Role")
+                .roleName("novilabs-homework-ec2role")
+                .assumedBy(new ServicePrincipal("ec2.amazonaws.com"))
+                // Attach AmazonSSMManagedInstanceCore so we can use Session Manager
+                .managedPolicies(List.of(
+                        ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMManagedInstanceCore"),
+                        ManagedPolicy.fromAwsManagedPolicyName("AmazonElasticFileSystemClientReadWriteAccess"),
+                        ManagedPolicy.fromAwsManagedPolicyName("AmazonS3ReadOnlyAccess")
+                ))
+                .build();
+
+        Instance instance = Instance.Builder.create(this, "NovilabsHomeworkEc2Instance")
+                .instanceName("novilabs-homework-instance-4-efs")
+                .vpc(vpc)
+                .role(ec2Role)
+                .securityGroup(taskSecurityGroup)
+                .instanceType(InstanceType.of(InstanceClass.T2, InstanceSize.MICRO))
+                .machineImage(MachineImage.latestAmazonLinux2())
+                .keyPair(KeyPair.fromKeyPairName(this, "VpcTestKeyPair", "vpc-test"))
+                .userDataCausesReplacement(true) // for quicker dev turnaround
+                // mount the file system under /mnt/efs and copy the CSV from S3 (assumed to be already uploaded)
+                .userData(UserData.custom("""
+                        #!/bin/bash
+                        echo 'User data starting'
+                        yum check-update -y && yum install -y amazon-efs-utils &&
+                        mkdir /mnt/efs &&
+                        mount -t efs -o tls %s:/ /mnt/efs &&
+                        aws s3 cp s3://novilabs-homework-bucket/novi-labs-java-assignment-data.csv /mnt/efs
+                        """.formatted(fs.getFileSystemId())))
+                .build();
+        // Grant the EC2 instance access to the EFS file system
+        fs.getConnections().allowDefaultPortFrom(instance); // is this needed even with the security groups?
+
+        return instance;
+    }
+
+    /**
+     * Start the ECS task by calling "ecs:RunTask" at deployment time.
+     *
+     * @param vpc
+     * @param cluster
+     * @param taskDef
+     * @param taskSecurityGroup
+     * @return
+     */
+    private AwsCustomResource runTask(Vpc vpc, Cluster cluster, FargateTaskDefinition taskDef, SecurityGroup taskSecurityGroup) {
+        return AwsCustomResource.Builder.create(this, "RunNovilabsHomeworkTask")
+                .onCreate(AwsSdkCall.builder()
+                        .service("ECS")
+                        .action("runTask")
+                        .parameters(Map.of(
+                                "cluster", cluster.getClusterName(),
+                                "launchType", "FARGATE",
+                                "taskDefinition", taskDef.getTaskDefinitionArn(),
+                                "networkConfiguration", Map.of(
+                                        "awsvpcConfiguration", Map.of(
+                                                "subnets", vpc.getPrivateSubnets().stream()
+                                                        .map(subnet -> subnet.getSubnetId())
+                                                        .collect(Collectors.toList()),
+                                                // securityGroups => the task SG
+                                                "securityGroups", List.of(taskSecurityGroup.getSecurityGroupId()),
+                                                // Assign a public IP if needed to pull images or access the internet
+                                                "assignPublicIp", "ENABLED"
+                                        )
+                                )
+                        ))
+                        // Provide a fixed PhysicalResourceId so it doesn't re-run every deploy
+                        .physicalResourceId(PhysicalResourceId.of("NovilabsHomeworkOneOffTask"))
+                        .build()
+                )
+                // Policy allowing this custom resource to call ecs:RunTask + pass roles
+                .policy(AwsCustomResourcePolicy.fromStatements(List.of(
+                        PolicyStatement.Builder.create()
+                                .actions(List.of("ecs:RunTask", "iam:PassRole"))
+                                // If you want to restrict resources, you'd specify your cluster ARN & taskDef ARN
+                                .resources(List.of("*"))
+                                .build()
+                )))
+                .build();
+    }
+
 }
