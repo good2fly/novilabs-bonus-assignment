@@ -118,7 +118,8 @@ public class NovilabsAssignmentCdkStack extends Stack {
                 .roleName("novilabs-homework-task-role")
                 .assumedBy(new ServicePrincipal("ecs-tasks.amazonaws.com"))
                 .managedPolicies(List.of(ManagedPolicy.fromAwsManagedPolicyName("AmazonElasticFileSystemClientReadWriteAccess"),
-                                         ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMManagedInstanceCore")))
+                                         ManagedPolicy.fromAwsManagedPolicyName("AmazonSSMManagedInstanceCore"),
+                                         ManagedPolicy.fromAwsManagedPolicyName("AmazonS3ReadOnlyAccess")))
                 .build();
         // Create the Fargate task definition w/ above roles
         FargateTaskDefinition taskDef = FargateTaskDefinition.Builder.create(this, "NovilabsHomeworkTaskDef")
@@ -142,9 +143,32 @@ public class NovilabsAssignmentCdkStack extends Stack {
                         .build())
                 .build());
 
-        // Create container referencing ECR image and mount EFS at /apppath
+        // Create sidecar container to mount the file system, and copy the CSV data file from S3
+        ContainerDefinition sidecar = taskDef.addContainer("NovilabsHomeworkSidecar",
+                ContainerDefinitionOptions.builder()
+                        .containerName("novilabs-homework-container-sidecar")
+                        .image(ContainerImage.fromRegistry("amazon/aws-cli:latest"))
+                        .command(List.of(
+                                "s3",
+                                "cp",
+                                "s3://novilabs-homework-bucket/novi-labs-java-assignment-data.csv",
+                                "/mnt/efs/"))
+                        .essential(false)
+                        .logging(LogDriver.awsLogs(AwsLogDriverProps.builder()
+                                .streamPrefix("novilabs-homework")
+                                .logRetention(RetentionDays.ONE_DAY)
+                                .build()))
+                        .build()
+        );
+        sidecar.addMountPoints(MountPoint.builder()
+                .containerPath("/mnt/efs")
+                .sourceVolume("NovilabsHomeworkEfsVolume")
+                .readOnly(false)
+                .build());
+
+        // Create main container referencing the ECR image with the Java app, and mount EFS at /apppath
         IRepository ecrRepo = Repository.fromRepositoryName(this, "MyRepo", "nv-home-assignment");
-        ContainerDefinition container = taskDef.addContainer("NovilabsHomeworkContainer",
+        ContainerDefinition mainContainer = taskDef.addContainer("NovilabsHomeworkContainer",
                 ContainerDefinitionOptions.builder()
                         .containerName("novilabs-homework-container")
                         .image(ContainerImage.fromEcrRepository(ecrRepo, "latest"))
@@ -158,27 +182,32 @@ public class NovilabsAssignmentCdkStack extends Stack {
                         .build()
         );
 
-        container.addMountPoints(MountPoint.builder()
+        mainContainer.addMountPoints(MountPoint.builder()
                 .containerPath("/apppath")  // mount EFS inside container at /apppath
                 .sourceVolume("NovilabsHomeworkEfsVolume")
                 .readOnly(false)
                 .build());
+        // Wait for the sidecar to finish successfully (i.e. copied the file from S3)
+        mainContainer.addContainerDependencies(ContainerDependency.builder()
+                        .container(sidecar)
+                        .condition(ContainerDependencyCondition.SUCCESS)
+                .build());
 
-        Instance instance = copyDataFileViaEc2AndS3(vpc, efs, taskSecurityGroup);
+        Instance instance = startEc2Instance(vpc, efs, taskSecurityGroup);
 
         // TODO this seems flaky, failing to mount the file system - investigate later (works fine from console)
         //AwsCustomResource runTaskResource = runTask(vpc, cluster, taskDef, taskSecurityGroup);
     }
 
     /**
-     * Create an EC2 instance, mount the file system, and copy the provided CSV data file from S3.
+     * Create an EC2 instance, and mount the file system (to verify results).
      *
      * @param vpc
      * @param fs
      * @param taskSecurityGroup
      * @return
      */
-    private Instance copyDataFileViaEc2AndS3(Vpc vpc, FileSystem fs, SecurityGroup taskSecurityGroup) {
+    private Instance startEc2Instance(Vpc vpc, FileSystem fs, SecurityGroup taskSecurityGroup) {
         Role ec2Role = Role.Builder.create(this, "NovilabsHomeworkEc2Role")
                 .roleName("novilabs-homework-ec2role")
                 .assumedBy(new ServicePrincipal("ec2.amazonaws.com"))
@@ -199,16 +228,16 @@ public class NovilabsAssignmentCdkStack extends Stack {
                 .machineImage(MachineImage.latestAmazonLinux2())
                 .keyPair(KeyPair.fromKeyPairName(this, "VpcTestKeyPair", "vpc-test"))
                 .userDataCausesReplacement(true) // for quicker dev turnaround
-                // mount the file system under /mnt/efs and copy the CSV from S3 (assumed to be already uploaded)
+                // mount the file system under /mnt/efs
                 .userData(UserData.custom("""
                         #!/bin/bash
                         echo 'User data starting'
                         yum check-update -y && yum install -y amazon-efs-utils &&
                         mkdir /mnt/efs &&
-                        mount -t efs -o tls %s:/ /mnt/efs &&
-                        aws s3 cp s3://novilabs-homework-bucket/novi-labs-java-assignment-data.csv /mnt/efs
+                        mount -t efs -o tls %s:/ /mnt/efs
                         """.formatted(fs.getFileSystemId())))
                 .build();
+
         // Grant the EC2 instance access to the EFS file system
         fs.getConnections().allowDefaultPortFrom(instance); // is this needed even with the security groups?
 
