@@ -20,16 +20,16 @@ aws ecs run-task \
     --network-configuration "awsvpcConfiguration={...}" ...
 ```
 ## Get Content onto the Volume
-* Create EC2 instance in one of the private subnets the mount targets are
-  * With role that has AmazonSSMManagedInstanceCore (e.g. rr-ssm-and-ecr-access-role)
-  * With the task's security group (novilabs-homework-task-sg)
-* Connect via session manager
-  * `sudo su ec2-user`
-  * `sudo mkdir /mnt/efs`
-  * `sudo mount -t nfs4 -o nfsvers=4.1 fs-0d174893c4ecda15b.efs.us-west-1.amazonaws.com:/ /mnt/efs`
-  * Add CSV
+The ECS task definition has a sidecar container that copies the source document
+(`novi-labs-java-assignment-data.csv` by default) from an S3 bucket onto the mounted
+EFS volume. Currently, if a different input file is needed, the steps are:
+- Upload the file into S3, take note of the URI
+- Update the CDK script:
+  - Change the S3 URI (the sidecar command)
+  - Update the file name in both the main and sidecar container, if needed  
 
-(alternative is to copy from S3 bucket)
+An EC2 instance is created during deployment that mounts the file system, this
+is provided so we can check the result, but is not really necessary for the assignment. 
 
 ## Useful commands
 
